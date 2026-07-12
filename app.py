@@ -7,6 +7,7 @@ from langchain_tavily import TavilySearch
 from pinecone import ServerlessSpec, Pinecone
 from langchain_core.stores import InMemoryStore
 from langchain_core.embeddings import Embeddings
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_mistralai import MistralAIEmbeddings
 from typing import TypedDict, Annotated, Literal, List
 from langgraph.graph.message import add_messages
@@ -183,10 +184,21 @@ def build_graph():
     # Now run your addition safely
     retriever.add_documents(sanitized_documents, ids=None)
 
+    # Mistral's free tier allows ~1 request/second. Throttle proactively so the
+    # call-heavy graph (per-doc grading + synthesis + rewrite loops) does not
+    # burst past the limit and get a 429. This blocks locally instead of failing.
+    rate_limiter = InMemoryRateLimiter(
+        requests_per_second=1,
+        check_every_n_seconds=0.1,
+        max_bucket_size=1,
+    )
+
     llm = ChatMistralAI(
         model="mistral-small-latest",
         mistral_api_key=os.environ.get("MISTRAL_KEY"),
         temperature=0,
+        max_retries=3,
+        rate_limiter=rate_limiter,
     )
     llm_with_grading = llm.with_structured_output(GradeDocuments)
     llm_with_hallucination = llm.with_structured_output(GradeHallucinations)
