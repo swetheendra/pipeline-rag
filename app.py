@@ -120,7 +120,9 @@ def build_graph(_pdf_bytes: bytes, file_key: str):
             pass
 
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+    # Larger child chunks (was 200) embed with more semantic context, improving
+    # retrieval recall for specific facts in large documents.
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
 
     # 1. Define the Wrapper Class
     class SanitizedMistralEmbeddings(Embeddings):
@@ -186,6 +188,9 @@ def build_graph(_pdf_bytes: bytes, file_key: str):
         docstore=docstore,
         child_splitter=child_splitter,
         parent_splitter=parent_splitter,
+        # Retrieve more child chunks so specific facts in a large document aren't
+        # missed. Default is k=4, which is far too low for an 80+ page report.
+        search_kwargs={"k": 15},
     )
 
     # 1. Clean and validate documents before passing to ParentDocumentRetriever
