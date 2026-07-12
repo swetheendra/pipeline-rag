@@ -105,21 +105,32 @@ def build_graph():
 
     # 1. Define the Wrapper Class
     class SanitizedMistralEmbeddings(Embeddings):
+        # mistral-embed rejects large requests with a 400; keep each request small.
+        BATCH_SIZE = 32
+
         def __init__(self, model):
             self.model = model
 
         def embed_documents(self, texts: List[str]) -> List[List[float]]:
-            # Clean data to protect against null bytes and blank chunks
-            cleaned_texts = [str(t).replace("\x00", "").strip() for t in texts if t and str(t).strip()]
-            
-            # Fallback to keep Mistral from throwing a 400 on empty batches
-            if not cleaned_texts:
-                cleaned_texts = ["fallback_text"]
-                
-            return self.model.embed_documents(cleaned_texts)
+            # Clean each text but PRESERVE list length (1:1 with input) so the
+            # returned embeddings stay aligned with Pinecone ids/metadatas.
+            cleaned_texts = []
+            for t in texts:
+                cleaned = str(t).replace("\x00", "").strip() if t is not None else ""
+                # Replace empties with a fallback token instead of dropping them,
+                # otherwise the embedding count won't match the document count.
+                cleaned_texts.append(cleaned if cleaned else "fallback_text")
+
+            # Batch requests so we never exceed mistral-embed's per-request limit.
+            embeddings: List[List[float]] = []
+            for i in range(0, len(cleaned_texts), self.BATCH_SIZE):
+                batch = cleaned_texts[i:i + self.BATCH_SIZE]
+                embeddings.extend(self.model.embed_documents(batch))
+            return embeddings
 
         def embed_query(self, text: str) -> List[float]:
-            return self.model.embed_query(text)
+            cleaned = str(text).replace("\x00", "").strip() or "fallback_text"
+            return self.model.embed_query(cleaned)
 
     # 2. Instantiate the raw model with your specific environment key
     raw_mistral = MistralAIEmbeddings(
