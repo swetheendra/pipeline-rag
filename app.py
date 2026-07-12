@@ -107,6 +107,29 @@ def build_graph():
         api_key=os.environ.get("MISTRAL_KEY"),
     )
 
+    # 2. Save the original embedding function
+    original_embed_documents = embeddings.embed_documents
+
+    # 3. Define a bulletproof wrapper that strips completely invisible text chunks
+    def bulletproof_embed_documents(texts: list[str]) -> list[list[float]]:
+        # Force clean every text string and drop anything that reduces to whitespace/emptiness
+        cleaned_texts = []
+        for t in texts:
+            if t is not None:
+                cleaned = str(t).replace("\x00", "").strip()
+                if cleaned:  # Only append if there is actual printable text left
+                    cleaned_texts.append(cleaned)
+        
+        # Mistral throws a 400 if you send it an empty array []
+        if not cleaned_texts:
+            # Provide a safe dummy token chunk if an entire batch was pure whitespace
+            cleaned_texts = ["empty_chunk_fallback"]
+            
+        return original_embed_documents(cleaned_texts)
+
+    # 4. Overwrite the method directly on your instance
+    embeddings.embed_documents = bulletproof_embed_documents
+
     pinecone_index = create_pinecone_index()
     docstore = InMemoryStore()
     store = PineconeVectorStore(index=pinecone_index, embedding=embeddings, text_key="text")
