@@ -63,6 +63,12 @@ class GradeDocuments(BaseModel):
     binary_score: Literal["yes", "no"] = Field(description="Documents are relevant to the question, score 'yes' or 'no'")
 
 
+class GradeDocumentsBatch(BaseModel):
+    scores: List[Literal["yes", "no"]] = Field(
+        description="Relevance score 'yes' or 'no' for each document, in the same order the documents were provided"
+    )
+
+
 class GradeHallucinations(BaseModel):
     binary_score: Literal["yes", "no"] = Field(description="Answer is grounded in / supported by facts in context, score 'yes' or 'no'")
 
@@ -193,15 +199,22 @@ def build_graph():
         max_bucket_size=1,
     )
 
-    llm = ChatMistralAI(
+    llm_core = ChatMistralAI(
         model="mistral-small-latest",
         mistral_api_key=os.environ.get("MISTRAL_KEY"),
         temperature=0,
         max_retries=3,
         rate_limiter=rate_limiter,
     )
-    llm_with_grading = llm.with_structured_output(GradeDocuments)
-    llm_with_hallucination = llm.with_structured_output(GradeHallucinations)
+
+    # Mistral's built-in retry does not back off on HTTP 429. Wrap every runnable
+    # with exponential-backoff retry so rate-limit hits are retried instead of
+    # crashing the graph. Structured-output binding must happen on the base model
+    # first (RunnableRetry has no with_structured_output), then wrap with retry.
+    _retry = dict(wait_exponential_jitter=True, stop_after_attempt=6)
+    llm = llm_core.with_retry(**_retry)
+    llm_with_grading = llm_core.with_structured_output(GradeDocumentsBatch).with_retry(**_retry)
+    llm_with_hallucination = llm_core.with_structured_output(GradeHallucinations).with_retry(**_retry)
 
     def retrieve_from_pinecone(state: AgentState):
         user_query = state["messages"][-1].content
@@ -216,15 +229,27 @@ def build_graph():
         if not context:
             return {"context": []}
 
-        filtered_context = []
-        for doc in context:
-            grader_prompt = f"""You are a grader assessing relevance of a retrieved document to a user question.
-            \nDocument: {doc} \nUser Question: {user_query}
-            \nDetermine if the document contains semantic keywords or answers to the question."""
+        # Grade ALL documents in a single LLM call (instead of one call per doc)
+        # to drastically cut request volume and avoid rate limiting.
+        numbered_docs = "\n\n".join(f"[{i}] {doc}" for i, doc in enumerate(context))
+        grader_prompt = f"""You are a grader assessing relevance of retrieved documents to a user question.
+        For EACH document below, decide if it contains semantic keywords or answers to the question.
+        Return a list of 'yes'/'no' scores in the SAME ORDER as the documents ({len(context)} documents total).
 
-            res = llm_with_grading.invoke(grader_prompt)
-            if res.binary_score == "yes":
-                filtered_context.append(doc)
+        User Question: {user_query}
+
+        Documents:
+        {numbered_docs}"""
+
+        res = llm_with_grading.invoke(grader_prompt)
+        scores = res.scores or []
+
+        if len(scores) == len(context):
+            filtered_context = [doc for doc, score in zip(context, scores) if score == "yes"]
+        else:
+            # Malformed grading (wrong count) -> be permissive and keep all docs
+            # rather than silently dropping relevant context.
+            filtered_context = context
 
         return {"context": filtered_context}
 
