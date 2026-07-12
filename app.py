@@ -6,7 +6,7 @@ from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_tavily import TavilySearch
 from pinecone import ServerlessSpec, Pinecone
 from langchain_core.stores import InMemoryStore
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_mistralai import MistralAIEmbeddings
 from typing import TypedDict, Annotated, Literal
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
@@ -67,10 +67,11 @@ class GradeHallucinations(BaseModel):
 
 def create_pinecone_index():
     pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
+    index_name = "rag-store-mistral"
     existing = pc.list_indexes().names()
-    if "rag-store" not in existing:
+    if index_name not in existing:
         pc.create_index(
-            name="rag-store",
+            name=index_name,
             dimension=1024,
             metric="cosine",
             spec=ServerlessSpec(
@@ -78,7 +79,7 @@ def create_pinecone_index():
                 region="us-east-1"
             )
         )
-    return pc.Index("rag-store")
+    return pc.Index(index_name)
 
 
 @st.cache_resource(show_spinner="Loading embedding model and building the RAG pipeline (first run only)...")
@@ -96,7 +97,10 @@ def build_graph():
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
 
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+    embeddings = MistralAIEmbeddings(
+        model="mistral-embed",
+        api_key=os.environ.get("MISTRAL_KEY"),
+    )
 
     pinecone_index = create_pinecone_index()
     docstore = InMemoryStore()
