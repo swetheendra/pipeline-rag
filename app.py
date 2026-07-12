@@ -128,7 +128,7 @@ def build_graph():
         return original_embed_documents(cleaned_texts)
 
     # 4. Overwrite the method directly on your instance
-    embeddings.embed_documents = bulletproof_embed_documents
+    object.__setattr__(embeddings, "embed_documents", bulletproof_embed_documents)
 
     pinecone_index = create_pinecone_index()
     docstore = InMemoryStore()
