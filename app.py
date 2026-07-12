@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from langchain_community.tools.tavily_search import TavilySearchResults
 import os
 import json
+import asyncio
 import streamlit as st
 
 # Bridge Streamlit secrets into environment variables so that both this code
@@ -30,11 +31,39 @@ for _key in ("MISTRAL_KEY", "TAVILY_API_KEY", "PINECONE_API_KEY"):
         # whatever is already in os.environ.
         break
 
-loader = PyPDFLoader("2025_AnnualReport.pdf")
-documents = loader.load()
+# Fail loudly but gracefully (in-app) instead of crashing the process at import
+# time. A missing key would otherwise make Pinecone()/ChatMistralAI() raise
+# during module load, which Streamlit Cloud reports as an opaque "spawn error".
+_required = ("MISTRAL_KEY", "TAVILY_API_KEY", "PINECONE_API_KEY")
+_missing = [k for k in _required if not os.environ.get(k)]
+if _missing:
+    st.error(
+        "Missing required secrets: "
+        + ", ".join(_missing)
+        + ". Add them under App → Settings → Secrets on Streamlit Cloud, "
+        "or in a local .streamlit/secrets.toml file, then rerun."
+    )
+    st.stop()
 
-parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+
+def reduce_context(left: list[str], right: list[str]) -> list[str]:
+    return right
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    context: Annotated[list[str], reduce_context]
+    is_faithful: Literal["yes", "no", "not_evaluated"]
+    loop_count: int
+
+
+class GradeDocuments(BaseModel):
+    binary_score: Literal["yes", "no"] = Field(description="Documents are relevant to the question, score 'yes' or 'no'")
+
+
+class GradeHallucinations(BaseModel):
+    binary_score: Literal["yes", "no"] = Field(description="Answer is grounded in / supported by facts in context, score 'yes' or 'no'")
+
 
 def create_pinecone_index():
     pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
@@ -52,246 +81,222 @@ def create_pinecone_index():
     return pc.Index("rag-store")
 
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-m3"
-)
+@st.cache_resource(show_spinner="Loading embedding model and building the RAG pipeline (first run only)...")
+def build_graph():
+    """Build heavy resources and the compiled LangGraph exactly once.
 
-pinecone_index = create_pinecone_index()
-docstore = InMemoryStore()
-store = PineconeVectorStore(index=pinecone_index, embedding = embeddings, text_key="text")
+    Everything that downloads a model, hits Pinecone, or re-ingests the PDF
+    lives here so it runs a single time per container instead of on every
+    Streamlit rerun. Node functions are nested so they close over these
+    resources instead of relying on module globals.
+    """
+    loader = PyPDFLoader("2025_AnnualReport.pdf")
+    documents = loader.load()
 
-retriever = ParentDocumentRetriever(vectorstore=store,docstore=docstore,child_splitter=child_splitter,parent_splitter=parent_splitter)
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
 
-retriever.add_documents(documents, ids=None)
+    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
 
-def reduce_context(left: list[str], right: list[str]) -> list[str]:
-    return right
+    pinecone_index = create_pinecone_index()
+    docstore = InMemoryStore()
+    store = PineconeVectorStore(index=pinecone_index, embedding=embeddings, text_key="text")
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
-    context: Annotated[list[str], reduce_context]
-    is_faithful: Literal["yes", "no", "not_evaluated"]
-    loop_count: int
+    retriever = ParentDocumentRetriever(
+        vectorstore=store,
+        docstore=docstore,
+        child_splitter=child_splitter,
+        parent_splitter=parent_splitter,
+    )
+    retriever.add_documents(documents, ids=None)
 
-def retrieve_from_pinecone(state:AgentState):
-    user_query = state["messages"][-1].content
-    retrieved_docs = retriever.invoke(user_query)
-    contents = [doc.page_content for doc in  retrieved_docs]
-    return {
-        "context": contents
-    }
+    llm = ChatMistralAI(
+        model="mistral-small-latest",
+        mistral_api_key=os.environ.get("MISTRAL_KEY"),
+        temperature=0,
+    )
+    llm_with_grading = llm.with_structured_output(GradeDocuments)
+    llm_with_hallucination = llm.with_structured_output(GradeHallucinations)
 
-mistral_key = os.environ.get("MISTRAL_KEY")
+    def retrieve_from_pinecone(state: AgentState):
+        user_query = state["messages"][-1].content
+        retrieved_docs = retriever.invoke(user_query)
+        contents = [doc.page_content for doc in retrieved_docs]
+        return {"context": contents}
 
-llm = ChatMistralAI(
-    model="mistral-small-latest",
-    mistral_api_key=mistral_key,
-    temperature=0,
-)
+    def grade_documents(state: AgentState):
+        user_query = state["messages"][-1].content
+        context = state["context"]
 
-class GradeDocuments(BaseModel):
-    binary_score: Literal["yes", "no"] = Field(description="Documents are relevant to the question, score 'yes' or 'no'")
+        if not context:
+            return {"context": []}
 
-llm_with_grading = llm.with_structured_output(GradeDocuments)
+        filtered_context = []
+        for doc in context:
+            grader_prompt = f"""You are a grader assessing relevance of a retrieved document to a user question.
+            \nDocument: {doc} \nUser Question: {user_query}
+            \nDetermine if the document contains semantic keywords or answers to the question."""
 
-class GradeHallucinations(BaseModel):
-    binary_score: Literal["yes", "no"] = Field(description="Answer is grounded in / supported by facts in context, score 'yes' or 'no'")
+            res = llm_with_grading.invoke(grader_prompt)
+            if res.binary_score == "yes":
+                filtered_context.append(doc)
 
-llm_with_hallucination = llm.with_structured_output(GradeHallucinations)
+        return {"context": filtered_context}
 
-def grade_documents(state: AgentState):
-    user_query = state["messages"][-1].content
-    context = state["context"]
+    def synthesis_node(state: AgentState):
+        user_query = state["messages"][-1].content
+        context = state["context"]
 
-    if not context:
-        return {
-            "context": []
-        }
+        if not context or len(context) == 0:
+            return {
+                "messages": [AIMessage(content="I'm sorry, but the retrieved documents do not contain information relevant to your request.")]
+            }
 
-    filtered_context = []
-    for doc in context:
-        grader_prompt = f"""You are a grader assessing relevance of a retrieved document to a user question.
-        \nDocument: {doc} \nUser Question: {user_query}
-        \nDetermine if the document contains semantic keywords or answers to the question."""
+        combined_context = "\n\n".join(context)
 
-        res = llm_with_grading.invoke(grader_prompt)
-        if res.binary_score == "yes":
-            filtered_context.append(doc)
+        system_prompt = f"""You are a precise, literal data extraction engine. Your task is to answer the user's query using ONLY the explicitly stated facts in the provided Context. 
+            
+            CRITICAL SAFETY RULES:
+            1. Grounding: Do not add background context, historical timelines, tech specs, or statistics unless they are written verbatim in the context block below. 
+            2. No Extrapolation: If the context says a protocol "helps limit metadata," do not explain *how* it limits metadata using your own knowledge of network packets.
+            3. Missing Information: If the context is insufficient to fully answer the comparison, state clearly what the context *does* provide, and note that the remaining details are missing from the source material.
+            
+            Context:
+            {combined_context}
+            
+            User Query: {user_query}
+            Answer:"""
 
-    return {"context": filtered_context}
+        response = llm.invoke(system_prompt)
+        return {"messages": response}
 
-def synthesis_node(state: AgentState):
-    user_query = state["messages"][-1].content
-    context = state["context"]
+    def query_rewriter_node(state: AgentState):
+        # CRITICAL: Always pull the first message (the user's actual question),
+        # not the last message which might be a failed synthesis or previous rewrite!
+        original_user_query = state["messages"][0].content
 
-    if not context or len(context) == 0:
-        return {
-            "messages": [AIMessage(content="I'm sorry, but the retrieved documents do not contain information relevant to your request.")]
-        }
-    
-    combined_context = "\n\n".join(context)
+        prompt = f"Optimize this user query for a Google search. Return ONLY the search terms. Do not include introductory text, explanations, or multiple choices:\n\n{original_user_query}"
 
-    system_prompt = f"""You are a precise, literal data extraction engine. Your task is to answer the user's query using ONLY the explicitly stated facts in the provided Context. 
-        
-        CRITICAL SAFETY RULES:
-        1. Grounding: Do not add background context, historical timelines, tech specs, or statistics unless they are written verbatim in the context block below. 
-        2. No Extrapolation: If the context says a protocol "helps limit metadata," do not explain *how* it limits metadata using your own knowledge of network packets.
-        3. Missing Information: If the context is insufficient to fully answer the comparison, state clearly what the context *does* provide, and note that the remaining details are missing from the source material.
-        
-        Context:
-        {combined_context}
-        
-        User Query: {user_query}
-        Answer:"""
-    
-    response = llm.invoke(system_prompt)
-    return {
-        "messages": response
-    }
+        response = llm.invoke(prompt)
 
-def query_rewriter_node(state: AgentState):
-    # CRITICAL: Always pull the first message (the user's actual question), 
-    # not the last message which might be a failed synthesis or previous rewrite!
-    original_user_query = state["messages"][0].content
-    
-    prompt = f"Optimize this user query for a Google search. Return ONLY the search terms. Do not include introductory text, explanations, or multiple choices:\n\n{original_user_query}"
-    
-    response = llm.invoke(prompt)
-    
-    # Strip any markdown backticks or text wraps the LLM might have added
-    clean_query = response.content.replace("`", "").replace("*", "").strip()
-    new_count = state.get("loop_count", 0) + 1
-    return {"messages": [HumanMessage(content=clean_query)], "loop_count": new_count}
+        # Strip any markdown backticks or text wraps the LLM might have added
+        clean_query = response.content.replace("`", "").replace("*", "").strip()
+        new_count = state.get("loop_count", 0) + 1
+        return {"messages": [HumanMessage(content=clean_query)], "loop_count": new_count}
 
-def web_search_node(state: AgentState):
-    raw_query = state["messages"][-1].content
-    clean_query = raw_query.replace("**", "").replace('"', '').strip()
-    
-    web_search_tool = TavilySearchResults(max_results=3)
-    results = web_search_tool.invoke({"query": clean_query[:380]})
-    
-    # --- DEFENSIVE PARSING START ---
-    # If the tool returned a stringified JSON array, parse it back to a list
-    if isinstance(results, str):
-        try:
-            results = json.loads(results)
-        except json.JSONDecodeError:
-            # Fallback if it's a plain unstructured text string instead of JSON
-            return {"context": [results]}
-    # --- DEFENSIVE PARSING END ---
+    def web_search_node(state: AgentState):
+        raw_query = state["messages"][-1].content
+        clean_query = raw_query.replace("**", "").replace('"', '').strip()
 
-    # Securely extract content now that results is guaranteed to be a list of dicts
-    extracted_contents = [item["content"] for item in results if isinstance(item, dict) and "content" in item]
-    
-    return {"context": extracted_contents}
+        web_search_tool = TavilySearchResults(max_results=3)
+        results = web_search_tool.invoke({"query": clean_query[:380]})
 
+        # --- DEFENSIVE PARSING START ---
+        # If the tool returned a stringified JSON array, parse it back to a list
+        if isinstance(results, str):
+            try:
+                results = json.loads(results)
+            except json.JSONDecodeError:
+                # Fallback if it's a plain unstructured text string instead of JSON
+                return {"context": [results]}
+        # --- DEFENSIVE PARSING END ---
 
-def grade_generation_node(state: AgentState):
-    context = " ".join(state["context"])
-    answer = state["messages"][-1].content
-    prompt = f"""You are an auditor verifying claims. 
-        Source Context: {context}
-        Generated Answer: {answer}
-        
-        Is every single claim in the Generated Answer explicitly supported by the Source Context? 
-        Respond with exactly 'yes' or 'no'."""
-    
-    # Execute LLM call...
-    res = llm_with_hallucination.invoke(prompt)
-    return {"is_faithful": res.binary_score}
+        # Securely extract content now that results is guaranteed to be a list of dicts
+        extracted_contents = [item["content"] for item in results if isinstance(item, dict) and "content" in item]
 
+        return {"context": extracted_contents}
 
-grader = StateGraph(AgentState)
-grader.add_node("retrieve_node", retrieve_from_pinecone)
-grader.add_node("grade_documents_node", grade_documents)
-grader.add_node("synthesis", synthesis_node)
-grader.add_node("query_rewriter_node", query_rewriter_node)
-grader.add_node("web_search_node", web_search_node)
-grader.add_node("grade_generation", grade_generation_node)
+    def grade_generation_node(state: AgentState):
+        context = " ".join(state["context"])
+        answer = state["messages"][-1].content
+        prompt = f"""You are an auditor verifying claims. 
+            Source Context: {context}
+            Generated Answer: {answer}
+            
+            Is every single claim in the Generated Answer explicitly supported by the Source Context? 
+            Respond with exactly 'yes' or 'no'."""
 
+        res = llm_with_hallucination.invoke(prompt)
+        return {"is_faithful": res.binary_score}
 
-grader.add_edge(START, "retrieve_node")
-grader.add_edge("retrieve_node", "grade_documents_node")
+    def grade_doc_router(state: AgentState):
+        if not state["context"]:
+            return "rewrite"
+        else:
+            return "synthesis"
 
-def grade_doc_router(state:AgentState):
-    if not state["context"]:
+    def hallucinating_router(state: AgentState):
+        loops = state.get("loop_count", 0)
+        if state.get("is_faithful") == "yes" or loops >= 5:
+            return "finish"
         return "rewrite"
-    else:
-        return "synthesis"
 
-grader.add_conditional_edges("grade_documents_node", grade_doc_router, {
-    "rewrite": "query_rewriter_node",
-    "synthesis": "synthesis"
-})
+    grader = StateGraph(AgentState)
+    grader.add_node("retrieve_node", retrieve_from_pinecone)
+    grader.add_node("grade_documents_node", grade_documents)
+    grader.add_node("synthesis", synthesis_node)
+    grader.add_node("query_rewriter_node", query_rewriter_node)
+    grader.add_node("web_search_node", web_search_node)
+    grader.add_node("grade_generation", grade_generation_node)
 
-grader.add_edge("query_rewriter_node", "web_search_node")
-grader.add_edge("web_search_node", "grade_documents_node")
+    grader.add_edge(START, "retrieve_node")
+    grader.add_edge("retrieve_node", "grade_documents_node")
 
-def hallucinating_router(state: AgentState):
-    loops = state.get("loop_count", 0)
-    if state.get("is_faithful") == "yes" or loops >= 5:
-        return "finish"
-    return "rewrite"
+    grader.add_conditional_edges("grade_documents_node", grade_doc_router, {
+        "rewrite": "query_rewriter_node",
+        "synthesis": "synthesis"
+    })
 
-grader.add_edge("synthesis", "grade_generation")
+    grader.add_edge("query_rewriter_node", "web_search_node")
+    grader.add_edge("web_search_node", "grade_documents_node")
 
-grader.add_conditional_edges("grade_generation", hallucinating_router, {
-    "finish": END,
-    "rewrite": "query_rewriter_node"
-})
+    grader.add_edge("synthesis", "grade_generation")
 
-graph = grader.compile()
+    grader.add_conditional_edges("grade_generation", hallucinating_router, {
+        "finish": END,
+        "rewrite": "query_rewriter_node"
+    })
 
-import asyncio
-import streamlit as st
-from langchain_core.messages import HumanMessage
+    return grader.compile()
+
 
 st.title("📉 RAG Pipeline")
 user_query = st.text_input("Enter your question:", value="")
 
-# Place this inside your Streamlit button event handler
 if st.button("Run Pipeline") and user_query:
-    
-    # 1. Initialize empty placeholders in UI to update dynamically
+
+    graph = build_graph()
+
     status_placeholder = st.empty()
     output_placeholder = st.empty()
-    
-    # 2. Define the asynchronous streaming processing loop
+
     async def run_pipeline_stream():
         inputs = {"messages": [HumanMessage(content=user_query)]}
-        
-        # Use an interactive status expander to show live node updates
+
         with status_placeholder.status("🤖 Initializing Graph Pipeline...", expanded=True) as status:
-            
+
             async for chunk in graph.astream(inputs, stream_mode="updates"):
                 for node_name, state_update in chunk.items():
-                    # Update status text live as nodes fire
                     status.update(label=f"📍 Currently Executing: **{node_name}**")
-                    
-                    # Print structural details to the screen
+
                     st.write(f"✓ **{node_name}** complete.")
                     with st.expander(f"View State Delta for {node_name}"):
                         st.json(state_update)
-                    
-                    # Catch the generation when synthesis node finishes
+
                     if node_name == "synthesis":
-                        # Adapt access method depending on if state_update['messages'] is a list or single message object
                         messages_data = state_update["messages"]
                         if isinstance(messages_data, list):
                             st.session_state["final_answer"] = messages_data[-1].content
                         else:
                             st.session_state["final_answer"] = messages_data.content
-            
+
             status.update(label="✅ Pipeline Execution Complete!", state="complete", expanded=False)
 
-    # 3. Execute the async loop inside Streamlit's synchronous ecosystem
     if "final_answer" in st.session_state:
-        del st.session_state["final_answer"] # Clear previous runs
-        
+        del st.session_state["final_answer"]
+
     asyncio.run(run_pipeline_stream())
-    
-    # 4. Render the final produced text answer cleanly at the bottom
+
     if "final_answer" in st.session_state:
         output_placeholder.subheader("📝 Final Answer")
         output_placeholder.write(st.session_state["final_answer"])
-
