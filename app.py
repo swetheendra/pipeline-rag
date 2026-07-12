@@ -117,7 +117,26 @@ def build_graph():
         child_splitter=child_splitter,
         parent_splitter=parent_splitter,
     )
-    retriever.add_documents(documents, ids=None)
+
+    # 1. Clean and validate documents before passing to ParentDocumentRetriever
+    sanitized_documents = []
+
+    for doc in documents:
+        # Remove null bytes and standardize whitespaces
+        text = doc.page_content.replace("\x00", "").strip()
+        
+        # Filter out empty or pure whitespace chunks which trigger Mistral 400 errors
+        if text:
+            doc.page_content = text
+            sanitized_documents.append(doc)
+
+    # 2. Check your child_splitter for safety
+    # If your child text splitter creates empty strings or fragments, it will fail inside the retriever.
+    # Ensure your child_splitter has a drop-empty configuration or use a clean iteration loop:
+    if sanitized_documents:
+        retriever.add_documents(sanitized_documents, ids=None)
+    else:
+        raise ValueError("The PDF yielded no valid text contents for embedding.")
 
     llm = ChatMistralAI(
         model="mistral-small-latest",
