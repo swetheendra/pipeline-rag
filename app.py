@@ -18,6 +18,8 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 import os
 import json
 import asyncio
+import hashlib
+import tempfile
 import streamlit as st
 
 # Bridge Streamlit secrets into environment variables so that both this code
@@ -90,25 +92,32 @@ def create_pinecone_index():
     return pc.Index(index_name)
 
 
-@st.cache_resource(show_spinner="Loading embedding model and building the RAG pipeline (first run only)...")
-def build_graph():
-    """Build heavy resources and the compiled LangGraph exactly once.
+@st.cache_resource(show_spinner="Ingesting your PDF and building the RAG pipeline (first time per document)...")
+def build_graph(_pdf_bytes: bytes, file_key: str):
+    """Build heavy resources and the compiled LangGraph for one uploaded PDF.
 
-    Everything that downloads a model, hits Pinecone, or re-ingests the PDF
-    lives here so it runs a single time per container instead of on every
-    Streamlit rerun. Node functions are nested so they close over these
-    resources instead of relying on module globals.
+    Cached per uploaded document via `file_key` (a content hash). `_pdf_bytes`
+    is underscore-prefixed so Streamlit does NOT try to hash the raw bytes for
+    caching -- `file_key` is the cache key instead. Everything that hits
+    Pinecone or re-ingests the PDF runs once per (document, container). Node
+    functions are nested so they close over these resources.
     """
     # Maximum number of query-rewrite/retry cycles before the graph gives up
     # and returns whatever it has (prevents infinite loops).
     MAX_LOOPS = 10
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Build the bulletproof absolute path to the PDF
-    pdf_path = os.path.join(current_dir, "2025_AnnualReport.pdf")
-    loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
+    # Persist the uploaded bytes to a temp file so PyPDFLoader can read them.
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(_pdf_bytes)
+        pdf_path = tmp.name
+    try:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+    finally:
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            pass
 
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
@@ -153,7 +162,24 @@ def build_graph():
 
     pinecone_index = create_pinecone_index()
     docstore = InMemoryStore()
-    store = PineconeVectorStore(index=pinecone_index, embedding=embeddings, text_key="text")
+
+    # Isolate each uploaded document in its own Pinecone namespace so questions
+    # only retrieve from the current PDF. Clear any stale vectors for this
+    # namespace first, so a re-ingest on a fresh container doesn't create
+    # duplicate child vectors.
+    namespace = f"doc-{file_key}"
+    try:
+        pinecone_index.delete(delete_all=True, namespace=namespace)
+    except Exception:
+        # Namespace may not exist yet on the very first ingest -> ignore.
+        pass
+
+    store = PineconeVectorStore(
+        index=pinecone_index,
+        embedding=embeddings,
+        text_key="text",
+        namespace=namespace,
+    )
 
     retriever = ParentDocumentRetriever(
         vectorstore=store,
@@ -389,11 +415,23 @@ def build_graph():
 
 
 st.title("📉 RAG Pipeline")
+
+uploaded_pdf = st.file_uploader("Upload a PDF to ask questions about", type="pdf")
+
+if uploaded_pdf is None:
+    st.info("👆 Upload a PDF file to get started.")
+    st.stop()
+
+# Read bytes once and derive a stable content hash used as the cache/namespace key.
+pdf_bytes = uploaded_pdf.getvalue()
+file_key = hashlib.sha256(pdf_bytes).hexdigest()[:16]
+st.caption(f"Loaded: **{uploaded_pdf.name}** ({len(pdf_bytes) // 1024} KB)")
+
 user_query = st.text_input("Enter your question:", value="")
 
 if st.button("Run Pipeline") and user_query:
 
-    graph = build_graph()
+    graph = build_graph(pdf_bytes, file_key)
 
     status_placeholder = st.empty()
     output_placeholder = st.empty()
