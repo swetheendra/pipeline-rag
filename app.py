@@ -130,13 +130,24 @@ def build_graph():
             doc.page_content = text
             sanitized_documents.append(doc)
 
-    # 2. Check your child_splitter for safety
-    # If your child text splitter creates empty strings or fragments, it will fail inside the retriever.
-    # Ensure your child_splitter has a drop-empty configuration or use a clean iteration loop:
-    if sanitized_documents:
-        retriever.add_documents(sanitized_documents, ids=None)
-    else:
-        raise ValueError("The PDF yielded no valid text contents for embedding.")
+    # Create a safe function wrapper to intercept and sanitize chunks
+    def safe_add_documents(documents, **kwargs):
+        sanitized = []
+        for doc in documents:
+            cleaned_text = doc.page_content.replace("\x00", "").strip()
+            # Only allow chunks that actually contain readable characters
+            if cleaned_text:
+                doc.page_content = cleaned_text
+                sanitized.append(doc)
+        # Forward the clean chunks to the real Pinecone backend
+        return original_add_documents(sanitized, **kwargs)
+
+    # Intercept the vectorstore method
+    original_add_documents = retriever.vectorstore.add_documents
+    retriever.vectorstore.add_documents = safe_add_documents
+
+    # Now run your addition safely
+    retriever.add_documents(sanitized_documents, ids=None)
 
     llm = ChatMistralAI(
         model="mistral-small-latest",
