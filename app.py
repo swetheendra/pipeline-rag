@@ -99,6 +99,9 @@ def build_graph():
     Streamlit rerun. Node functions are nested so they close over these
     resources instead of relying on module globals.
     """
+    # Maximum number of query-rewrite/retry cycles before the graph gives up
+    # and returns whatever it has (prevents infinite loops).
+    MAX_LOOPS = 5
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -330,14 +333,19 @@ def build_graph():
         return {"is_faithful": res.binary_score}
 
     def grade_doc_router(state: AgentState):
+        loops = state.get("loop_count", 0)
         if not state["context"]:
+            # Stop the retrieve -> rewrite -> web_search loop once the loop
+            # budget is exhausted; fall through to synthesis, which returns a
+            # safe "no relevant information" message for empty context.
+            if loops >= MAX_LOOPS:
+                return "synthesis"
             return "rewrite"
-        else:
-            return "synthesis"
+        return "synthesis"
 
     def hallucinating_router(state: AgentState):
         loops = state.get("loop_count", 0)
-        if state.get("is_faithful") == "yes" or loops >= 5:
+        if state.get("is_faithful") == "yes" or loops >= MAX_LOOPS:
             return "finish"
         return "rewrite"
 
