@@ -15,6 +15,20 @@ from pydantic import BaseModel, Field
 from langchain_community.tools.tavily_search import TavilySearchResults
 import os
 import json
+import streamlit as st
+
+# Bridge Streamlit secrets into environment variables so that both this code
+# (os.environ.get) and LangChain tools (which read keys like TAVILY_API_KEY
+# directly from the environment) can find them. Works on Streamlit Cloud and
+# locally via .streamlit/secrets.toml.
+for _key in ("MISTRAL_KEY", "TAVILY_API_KEY", "PINECONE_API_KEY"):
+    try:
+        if _key in st.secrets:
+            os.environ.setdefault(_key, str(st.secrets[_key]))
+    except Exception:
+        # No secrets file present (e.g. pure env-var deployment); fall back to
+        # whatever is already in os.environ.
+        break
 
 loader = PyPDFLoader("2025_AnnualReport.pdf")
 documents = loader.load()
@@ -23,7 +37,7 @@ parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=
 child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
 
 def create_pinecone_index():
-    pc = Pinecone("pcsk_4Ky5EZ_HDjbkVMCQVTAUYMUZq8NM2zmt15vEsBHKVYEGvyRWHPgvxZrDEN1NCufoTsMYU2")
+    pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
     existing = pc.list_indexes().names()
     if "rag-store" not in existing:
         pc.create_index(

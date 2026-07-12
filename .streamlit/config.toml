@@ -1,0 +1,5 @@
+[server]
+# Disable the module source watcher. It walks __path__ of every imported
+# module, which triggers transformers' lazy imports (e.g. VideoMAE/ViLT image
+# processors) that require torchvision and spam ModuleNotFoundError tracebacks.
+fileWatcherType = "none"
