@@ -236,7 +236,10 @@ def build_graph():
         # to drastically cut request volume and avoid rate limiting.
         numbered_docs = "\n\n".join(f"[{i}] {doc}" for i, doc in enumerate(context))
         grader_prompt = f"""You are a grader assessing relevance of retrieved documents to a user question.
-        For EACH document below, decide if it contains semantic keywords or answers to the question.
+        Grade GENEROUSLY: mark a document 'yes' if it is topically related or contains
+        ANY facts, terms, or partial information that could help answer the question.
+        A document does NOT need to fully answer the question to be relevant.
+        Only mark 'no' if the document is clearly about an unrelated topic.
         Return a list of 'yes'/'no' scores in the SAME ORDER as the documents ({len(context)} documents total).
 
         User Question: {user_query}
@@ -252,6 +255,13 @@ def build_graph():
         else:
             # Malformed grading (wrong count) -> be permissive and keep all docs
             # rather than silently dropping relevant context.
+            filtered_context = context
+
+        # Safety net: if grading rejected EVERY document, don't collapse to empty
+        # (which triggers an endless rewrite loop and ultimately a "no relevant
+        # information" answer). Keep the retrieved docs so synthesis can still
+        # attempt an answer from partially-relevant context.
+        if not filtered_context:
             filtered_context = context
 
         return {"context": filtered_context}
