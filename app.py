@@ -91,7 +91,12 @@ def build_graph():
     Streamlit rerun. Node functions are nested so they close over these
     resources instead of relying on module globals.
     """
-    loader = PyPDFLoader("2025_AnnualReport.pdf")
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Build the bulletproof absolute path to the PDF
+    pdf_path = os.path.join(current_dir, "2025_AnnualReport.pdf")
+    loader = PyPDFLoader(pdf_path)
     documents = loader.load()
 
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
