@@ -1,0 +1,14 @@
+streamlit>=1.30.0
+langgraph
+langchain
+langchain-core
+langchain-huggingface
+langchain-community
+langchain-mistralai
+langchain-tavily
+langchain-pinecone
+langchain-classic
+langchain-text-splitters
+pinecone
+pypdf
+sentence-transformers
