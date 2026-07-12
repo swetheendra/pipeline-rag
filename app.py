@@ -101,7 +101,7 @@ def build_graph():
     """
     # Maximum number of query-rewrite/retry cycles before the graph gives up
     # and returns whatever it has (prevents infinite loops).
-    MAX_LOOPS = 5
+    MAX_LOOPS = 10
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -393,7 +393,7 @@ if st.button("Run Pipeline") and user_query:
 
         with status_placeholder.status("🤖 Initializing Graph Pipeline...", expanded=True) as status:
 
-            async for chunk in graph.astream(inputs, stream_mode="updates"):
+            async for chunk in graph.astream(inputs, stream_mode="updates", config={"recursion_limit": 50}):
                 for node_name, state_update in chunk.items():
                     status.update(label=f"📍 Currently Executing: **{node_name}**")
 
