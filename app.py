@@ -2,10 +2,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_pinecone import PineconeVectorStore
-from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_tavily import TavilySearch
 from pinecone import ServerlessSpec, Pinecone
-from langchain_core.stores import InMemoryStore
 from langchain_core.embeddings import Embeddings
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_mistralai import MistralAIEmbeddings
@@ -119,10 +117,10 @@ def build_graph(_pdf_bytes: bytes, file_key: str):
         except OSError:
             pass
 
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-    # Larger child chunks (was 200) embed with more semantic context, improving
-    # retrieval recall for specific facts in large documents.
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+    # Single splitter: chunks are stored directly in Pinecone (self-contained),
+    # so retrieval doesn't depend on an ephemeral in-process parent store. Larger
+    # chunks give synthesis enough surrounding context to answer.
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
 
     # 1. Define the Wrapper Class
     class SanitizedMistralEmbeddings(Embeddings):
@@ -159,16 +157,15 @@ def build_graph(_pdf_bytes: bytes, file_key: str):
         api_key=os.environ.get("MISTRAL_KEY"),
     )
 
-    # 3. Wrap it! This 'embeddings' variable goes right into your Pinecone/Retriever setup
+    # 3. Wrap it! This 'embeddings' variable goes right into your Pinecone setup
     embeddings = SanitizedMistralEmbeddings(model=raw_mistral)
 
     pinecone_index = create_pinecone_index()
-    docstore = InMemoryStore()
 
     # Isolate each uploaded document in its own Pinecone namespace so questions
     # only retrieve from the current PDF. Clear any stale vectors for this
     # namespace first, so a re-ingest on a fresh container doesn't create
-    # duplicate child vectors.
+    # duplicate vectors.
     namespace = f"doc-{file_key}"
     try:
         pinecone_index.delete(delete_all=True, namespace=namespace)
@@ -183,46 +180,22 @@ def build_graph(_pdf_bytes: bytes, file_key: str):
         namespace=namespace,
     )
 
-    retriever = ParentDocumentRetriever(
-        vectorstore=store,
-        docstore=docstore,
-        child_splitter=child_splitter,
-        parent_splitter=parent_splitter,
-        # Retrieve more child chunks so specific facts in a large document aren't
-        # missed. Default is k=4, which is far too low for an 80+ page report.
-        search_kwargs={"k": 15},
-    )
-
-    # 1. Clean and validate documents before passing to ParentDocumentRetriever
+    # Split, sanitize (drop empty/whitespace-only chunks), and ingest directly
+    # into Pinecone. No parent/child mapping, no in-memory docstore -> retrieval
+    # is fully backed by Pinecone and survives process/container restarts.
+    split_docs = text_splitter.split_documents(documents)
     sanitized_documents = []
-
-    for doc in documents:
-        # Remove null bytes and standardize whitespaces
+    for doc in split_docs:
         text = doc.page_content.replace("\x00", "").strip()
-        
-        # Filter out empty or pure whitespace chunks which trigger Mistral 400 errors
         if text:
             doc.page_content = text
             sanitized_documents.append(doc)
 
-    # Create a safe function wrapper to intercept and sanitize chunks
-    def safe_add_documents(documents, **kwargs):
-        sanitized = []
-        for doc in documents:
-            cleaned_text = doc.page_content.replace("\x00", "").strip()
-            # Only allow chunks that actually contain readable characters
-            if cleaned_text:
-                doc.page_content = cleaned_text
-                sanitized.append(doc)
-        # Forward the clean chunks to the real Pinecone backend
-        return original_add_documents(sanitized, **kwargs)
+    if sanitized_documents:
+        store.add_documents(sanitized_documents)
 
-    # Intercept the vectorstore method
-    original_add_documents = retriever.vectorstore.add_documents
-    retriever.vectorstore.add_documents = safe_add_documents
-
-    # Now run your addition safely
-    retriever.add_documents(sanitized_documents, ids=None)
+    # Retrieve enough chunks that specific facts in a large document aren't missed.
+    retriever = store.as_retriever(search_kwargs={"k": 15})
 
     # Mistral's free tier allows ~1 request/second. Throttle proactively so the
     # call-heavy graph (per-doc grading + synthesis + rewrite loops) does not
